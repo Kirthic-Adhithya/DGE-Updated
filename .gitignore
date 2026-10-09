@@ -1,0 +1,14 @@
+# caches and generated data (never commit these)
+__pycache__/
+*.pyc
+.vscode/
+edit_cache/
+.threestudio_cache/
+outputs/
+*.log
+*.ply
+*.pth
+*.ckpt
+*.safetensors
+*.png
+!gaussiansplatting/**/*.png

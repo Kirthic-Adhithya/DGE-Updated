@@ -8,6 +8,7 @@ from diffusers import DDIMScheduler, StableDiffusionInstructPix2PixPipeline
 from diffusers.utils.import_utils import is_xformers_available
 from tqdm import tqdm
 import math
+import time
 import threestudio
 from threestudio.models.prompt_processors.base import PromptProcessorOutput
 from threestudio.utils.base import BaseObject
@@ -42,6 +43,7 @@ class DGEGuidance(BaseObject):
         diffusion_steps: int = 20
         use_sds: bool = False
         camera_batch_size: int = 5
+        vae_chunk_size: int = 4  # views per VAE call; lower = less VRAM
 
     cfg: Config
 
@@ -147,8 +149,14 @@ class DGEGuidance(BaseObject):
     ) -> Float[Tensor, "B 4 DH DW"]:
         input_dtype = imgs.dtype
         imgs = imgs * 2.0 - 1.0
-        posterior = self.vae.encode(imgs.to(self.weights_dtype)).latent_dist
-        latents = posterior.sample() * self.vae.config.scaling_factor
+        # chunked so the VAE activations of all views never live on the GPU at once (8 GB cards)
+        latents = torch.cat(
+            [
+                self.vae.encode(chunk.to(self.weights_dtype)).latent_dist.sample()
+                for chunk in imgs.split(self.cfg.vae_chunk_size)
+            ],
+            dim=0,
+        ) * self.vae.config.scaling_factor
         return latents.to(input_dtype)
 
     @torch.cuda.amp.autocast(enabled=False)
@@ -157,8 +165,13 @@ class DGEGuidance(BaseObject):
     ) -> Float[Tensor, "B 4 DH DW"]:
         input_dtype = imgs.dtype
         imgs = imgs * 2.0 - 1.0
-        posterior = self.vae.encode(imgs.to(self.weights_dtype)).latent_dist
-        latents = posterior.mode()
+        latents = torch.cat(
+            [
+                self.vae.encode(chunk.to(self.weights_dtype)).latent_dist.mode()
+                for chunk in imgs.split(self.cfg.vae_chunk_size)
+            ],
+            dim=0,
+        )
         uncond_image_latents = torch.zeros_like(latents)
         latents = torch.cat([latents, latents, uncond_image_latents], dim=0)
         return latents.to(input_dtype)
@@ -169,7 +182,13 @@ class DGEGuidance(BaseObject):
     ) -> Float[Tensor, "B 3 H W"]:
         input_dtype = latents.dtype
         latents = 1 / self.vae.config.scaling_factor * latents
-        image = self.vae.decode(latents.to(self.weights_dtype)).sample
+        image = torch.cat(
+            [
+                self.vae.decode(chunk.to(self.weights_dtype)).sample
+                for chunk in latents.split(self.cfg.vae_chunk_size)
+            ],
+            dim=0,
+        )
         image = (image * 0.5 + 0.5).clamp(0, 1)
         return image.to(input_dtype)
 
@@ -204,7 +223,9 @@ class DGEGuidance(BaseObject):
             # sections of code used from https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_instruct_pix2pix.py
             positive_text_embedding, negative_text_embedding, _ = text_embeddings.chunk(3)
             split_image_cond_latents, _, zero_image_cond_latents = image_cond_latents.chunk(3)
-            for t in self.scheduler.timesteps:
+            for step_i, t in enumerate(self.scheduler.timesteps):
+                t_start = time.perf_counter()
+                t_epi = 0.0
                 if t < 100:
                     self.use_normal_unet()
                 else:
@@ -214,7 +235,7 @@ class DGEGuidance(BaseObject):
                     noise_pred_text = []
                     noise_pred_image = []
                     noise_pred_uncond = []
-                    pivotal_idx = torch.randint(camera_batch_size, (len(latents)//camera_batch_size,)) + torch.arange(0, len(latents), camera_batch_size) 
+                    pivotal_idx = torch.randint(camera_batch_size, (len(latents)//camera_batch_size,)) + torch.arange(0, len(latents), camera_batch_size)
                     register_pivotal(self.unet, True)
                     
                     key_cams = [cams[cam_pivotal_idx] for cam_pivotal_idx in pivotal_idx.tolist()]
@@ -230,6 +251,7 @@ class DGEGuidance(BaseObject):
                         register_batch_idx(self.unet, i)
                         register_cams(self.unet, cams[b:b + camera_batch_size], pivotal_idx[i] % camera_batch_size, key_cams) 
                         
+                        t0 = time.perf_counter()
                         epipolar_constrains = {}
                         for down_sample_factor in [1, 2, 4, 8]:
                             H = current_H // down_sample_factor
@@ -242,6 +264,8 @@ class DGEGuidance(BaseObject):
                                 epipolar_constrains[H * W].append(torch.stack(cam_epipolar_constrains, dim=0))
                             epipolar_constrains[H * W] = torch.stack(epipolar_constrains[H * W], dim=0)
                         register_epipolar_constrains(self.unet, epipolar_constrains)
+                        torch.cuda.synchronize()
+                        t_epi += time.perf_counter() - t0
 
                         batch_model_input = torch.cat([latents[b:b + camera_batch_size]] * 3)
                         batch_text_embeddings = torch.cat([positive_text_embedding[b:b + camera_batch_size], negative_text_embedding[b:b + camera_batch_size], negative_text_embedding[b:b + camera_batch_size]], dim=0)
@@ -267,7 +291,16 @@ class DGEGuidance(BaseObject):
 
                     # get previous sample, continue loop
                     latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-                    
+                torch.cuda.synchronize()
+                print(
+                    f"[DGE] denoise step {step_i + 1}/{len(self.scheduler.timesteps)} t={int(t)}: "
+                    f"{time.perf_counter() - t_start:.1f}s total, {t_epi:.1f}s epipolar | "
+                    f"VRAM peak {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB, "
+                    f"reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB",
+                    flush=True,
+                )
+                torch.cuda.empty_cache()  # drop cached blocks (epipolar temporaries) so they don't fragment the 8 GB card
+
         print("Editing finished.")
         return latents
 

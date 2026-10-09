@@ -1,0 +1,4 @@
+# the lab machine is Linux: shell scripts and Python must keep LF line endings
+*.sh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf

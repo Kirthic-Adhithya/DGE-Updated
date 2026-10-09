@@ -25,6 +25,7 @@ from argparse import ArgumentParser
 from threestudio.utils.misc import get_device
 from threestudio.utils.perceptual import PerceptualLoss
 from threestudio.utils.sam import LangSAMTextSegmentor
+from threestudio.utils.consistency import edit_inconsistency, inconsistency_to_weight
 
 @threestudio.register("dge-system")
 class DGE(BaseLift3DSystem):
@@ -72,8 +73,16 @@ class DGE(BaseLift3DSystem):
 
         # guidance 
         camera_update_per_step: int = 500
-        added_noise_schedule: List[int] = field(default_factory=[999, 200, 200, 21])    
-        
+        added_noise_schedule: List[int] = field(default_factory=[999, 200, 200, 21])
+
+        # consistency-weighted fitting (our extension, see threestudio/utils/consistency.py)
+        use_consistency_weight: bool = False
+        cw_sigma: float = 0.1  # inconsistency (mean abs RGB diff) at which a pixel's weight drops to 1/e
+        cw_min_weight: float = 0.1
+        cw_neighbors: int = 3
+        cw_depth_tol: float = 0.05  # relative depth tolerance of the visibility test
+        cw_tol_px: int = 2  # tolerate this much warp misalignment (pixels) when comparing views
+
 
     cfg: Config
 
@@ -89,9 +98,13 @@ class DGE(BaseLift3DSystem):
             bg_color, dtype=torch.float32, device="cuda"
         )
         self.edit_frames = {}
+        self.edit_weights = {}  # view id -> [1, H, W, 1] trust in the 2D edit (consistency-weighted fitting)
         self.origin_frames = {}
         self.perceptual_loss = PerceptualLoss().eval().to(get_device())
-        self.text_segmentor = LangSAMTextSegmentor().to(get_device())
+        # SAM + GroundingDINO are only needed for local editing; skip loading them otherwise to save VRAM.
+        self.text_segmentor = (
+            LangSAMTextSegmentor().to(get_device()) if len(self.cfg.seg_prompt) > 0 else None
+        )
 
         if len(self.cfg.cache_dir) > 0:
             self.cache_dir = os.path.join("edit_cache", self.cfg.cache_dir)
@@ -120,7 +133,7 @@ class DGE(BaseLift3DSystem):
 
                 cur_cam = self.trainer.datamodule.train_dataset.scene.cameras[id]
 
-                mask = self.text_segmentor(self.origin_frames[id], self.cfg.seg_prompt)[
+                mask = self.text_segmentor(self.origin_frames[id].to(get_device()), self.cfg.seg_prompt)[
                     0
                 ].to(get_device())
 
@@ -135,7 +148,7 @@ class DGE(BaseLift3DSystem):
                 ).astype(np.uint8)
                 cv2.imwrite(cur_path, mask_to_save)
 
-                masked_image = self.origin_frames[id].detach().clone()[0]
+                masked_image = self.origin_frames[id].detach().clone()[0].to(mask.device)
                 masked_image[mask[0].bool()] *= 0.3
                 masked_image_to_save = (
                         masked_image.cpu().detach().numpy().clip(0.0, 1.0) * 255.0
@@ -259,8 +272,9 @@ class DGE(BaseLift3DSystem):
                     out_to_save = cv2.cvtColor(out_to_save, cv2.COLOR_RGB2BGR)
                     cv2.imwrite(cur_path, out_to_save)
                 cached_image = cv2.cvtColor(cv2.imread(cur_path), cv2.COLOR_BGR2RGB)
+                # kept on the CPU: all views (251 for the truck) on the GPU cost ~0.8 GB; edit_all_view moves the active ones to the GPU
                 self.origin_frames[id] = torch.tensor(
-                    cached_image / 255, device="cuda", dtype=torch.float32
+                    cached_image / 255, device="cpu", dtype=torch.float32
                 )[None]
 
     def on_before_optimizer_step(self, optimizer):
@@ -542,6 +556,7 @@ class DGE(BaseLift3DSystem):
         cameras = []
         images = []
         original_frames = []
+        depth_list = []
         t_max_step = self.cfg.added_noise_schedule
         self.guidance.max_step = t_max_step[min(len(t_max_step)-1, self.true_global_step//self.cfg.camera_update_per_step)]
         with torch.no_grad():
@@ -566,6 +581,8 @@ class DGE(BaseLift3DSystem):
                 if self.cfg.use_masked_image:
                     out = out * out_pkg["masks"].unsqueeze(-1)
                 images.append(out)
+                if self.cfg.use_consistency_weight:
+                    depth_list.append(self.render_normalised_depth(cur_cam, out_pkg["depth"][0, ..., 0]))
                 assert os.path.exists(original_image_path)
                 cached_image = cv2.cvtColor(cv2.imread(original_image_path), cv2.COLOR_BGR2RGB)
                 self.origin_frames[id] = torch.tensor(
@@ -584,7 +601,49 @@ class DGE(BaseLift3DSystem):
 
             for view_index_tmp in range(len(self.view_list)):
                 self.edit_frames[view_sorted[view_index_tmp]] = edited_images['edit_images'][view_index_tmp].unsqueeze(0).detach().clone() # 1 H W C
-    
+
+            if self.cfg.use_consistency_weight:
+                self.update_consistency_weights(view_sorted, cams_sorted, depth_list)
+
+    @torch.no_grad()
+    def render_normalised_depth(self, cam, depth) -> torch.Tensor:
+        """View-space z per pixel. The rasterizer returns sum(z * alpha * T), so divide by the accumulated opacity
+        (rendered by painting every Gaussian white on black); pixels that are mostly empty get depth 0 = 'unknown'."""
+        ones = torch.ones_like(self.gaussian.get_xyz)
+        alpha = render(cam, self.gaussian, self.pipe, self.background_tensor, override_color=ones)["render"][0]
+        return torch.where(alpha > 0.5, depth / alpha.clamp(min=1e-3), torch.zeros_like(depth))
+
+    @torch.no_grad()
+    def update_consistency_weights(self, view_ids, cams, depths) -> None:
+        """Per-pixel trust in each 2D edit, from how well it agrees with the edits of neighbouring views."""
+        origs = [self.origin_frames[i][0] for i in view_ids]
+        edits = [self.edit_frames[i][0] for i in view_ids]
+        inc = edit_inconsistency(
+            cams, depths, origs, edits, k=self.cfg.cw_neighbors, depth_tol=self.cfg.cw_depth_tol,
+            tol_px=self.cfg.cw_tol_px,
+        )
+        self.edit_weights = {}
+        vis_rows = []
+        for n, vid in enumerate(view_ids):
+            w = inconsistency_to_weight(inc[n], self.cfg.cw_sigma, self.cfg.cw_min_weight)
+            self.edit_weights[vid] = w[None, :, :, None]
+            if n % max(1, len(view_ids) // 6) == 0:  # a handful of views for the visualisation
+                heat = (w.clamp(0, 1)[..., None].repeat(1, 1, 3) * 255).byte().cpu().numpy()
+                edit = (edits[n].clamp(0, 1) * 255).byte().cpu().numpy()
+                vis_rows.append(np.concatenate([edit, heat], axis=0))
+        all_w = torch.cat([w.flatten() for w in self.edit_weights.values()])
+        threestudio.info(
+            f"consistency weights: mean {all_w.mean():.3f}, {(all_w < 0.5).float().mean() * 100:.1f}% of pixels below 0.5"
+        )
+        print(
+            f"[CW] mean weight {all_w.mean():.3f} | pixels with weight<0.5: {(all_w < 0.5).float().mean() * 100:.1f}%",
+            flush=True,
+        )
+        cv2.imwrite(
+            self.get_save_path(f"consistency_it{self.true_global_step}.png"),
+            cv2.cvtColor(np.concatenate(vis_rows, axis=1), cv2.COLOR_RGB2BGR),
+        )
+
     def sort_the_cameras_idx(self, cams):
         foward_vectos = [cam.R[:, 2] for cam in cams]
         foward_vectos = np.array(foward_vectos)
@@ -658,6 +717,12 @@ class DGE(BaseLift3DSystem):
 
                 gt_images.append(self.edit_frames[cur_index])
             gt_images = torch.concatenate(gt_images, dim=0)
+            if self.cfg.use_consistency_weight and all(i in self.edit_weights for i in batch_index):
+                # Trust the edit only where it agrees with neighbouring views: where weight is low the target becomes
+                # the current render, so those pixels (L1 and LPIPS alike) stop pulling the Gaussians.
+                w = torch.cat([self.edit_weights[i] for i in batch_index], dim=0)
+                gt_images = w * gt_images + (1 - w) * images.detach()
+                self.log("train/mean_consistency_weight", w.mean())
             if self.cfg.use_masked_image:
                 print("use masked image")
                 guidance_out = {

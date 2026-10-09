@@ -241,8 +241,12 @@ def register_normal_attention(model):
             key = self.head_to_batch_dim(k)
             value = self.head_to_batch_dim(v)
 
-            attention_probs = self.get_attention_scores(query, key)
-            hidden_states = torch.bmm(attention_probs, value)
+            # fused attention: same result as softmax(q k^T * scale) v without materializing the (heads*batch, 4096, 4096)
+            # score matrix, which was a multi-GiB VRAM spike once t < 100 (normal-attention phase)
+            # (the fused flash / mem-efficient kernels need 4-D input; 3-D silently falls back to the math kernel)
+            hidden_states = torch.nn.functional.scaled_dot_product_attention(
+                query.unsqueeze(1), key.unsqueeze(1), value.unsqueeze(1)
+            ).squeeze(1)
             out = self.batch_to_head_dim(hidden_states)
 
             return to_out(out)
@@ -298,10 +302,6 @@ def register_extended_attention(model):
             v_image = self.head_to_batch_dim(v_image)
             v_uncond = self.head_to_batch_dim(v_uncond)
 
-            out_text = []
-            out_image = []
-            out_uncond = []
-
             q_text = q_text.view(n_frames, h, sequence_length, dim // h)
             k_text = k_text.view(n_frames, h, sequence_length * n_frames, dim // h)
             v_text = v_text.view(n_frames, h, sequence_length * n_frames, dim // h)
@@ -314,18 +314,12 @@ def register_extended_attention(model):
             k_uncond = k_uncond.view(n_frames, h, sequence_length * n_frames, dim // h)
             v_uncond = v_uncond.view(n_frames, h, sequence_length * n_frames, dim // h)
 
-            for j in range(h):
-                sim_text = torch.bmm(q_text[:, j], k_text[:, j].transpose(-1, -2)) * self.scale
-                sim_image = torch.bmm(q_image[:, j], k_image[:, j].transpose(-1, -2)) * self.scale
-                sim_uncond = torch.bmm(q_uncond[:, j], k_uncond[:, j].transpose(-1, -2)) * self.scale
-                
-                out_text.append(torch.bmm(sim_text.softmax(dim=-1), v_text[:, j]))
-                out_image.append(torch.bmm(sim_image.softmax(dim=-1), v_image[:, j]))
-                out_uncond.append(torch.bmm(sim_uncond.softmax(dim=-1), v_uncond[:, j]))
-
-            out_text = torch.cat(out_text, dim=0).view(h, n_frames, sequence_length, dim // h).permute(1, 0, 2, 3).reshape(h * n_frames, sequence_length, -1)
-            out_image = torch.cat(out_image, dim=0).view(h, n_frames,sequence_length, dim // h).permute(1, 0, 2, 3).reshape(h * n_frames, sequence_length, -1)
-            out_uncond = torch.cat(out_uncond, dim=0).view(h, n_frames,sequence_length, dim // h).permute(1, 0, 2, 3).reshape(h * n_frames, sequence_length, -1)
+            # Fused attention (same math as softmax(q k^T * scale) v, default scale = 1/sqrt(d) == self.scale) that never
+            # materializes the (seq x n_frames*seq) similarity matrix; the per-head bmm version needed ~3 GB extra VRAM.
+            sdpa = torch.nn.functional.scaled_dot_product_attention
+            out_text = sdpa(q_text, k_text, v_text).reshape(n_frames * h, sequence_length, -1)
+            out_image = sdpa(q_image, k_image, v_image).reshape(n_frames * h, sequence_length, -1)
+            out_uncond = sdpa(q_uncond, k_uncond, v_uncond).reshape(n_frames * h, sequence_length, -1)
 
             out = torch.cat([out_text, out_image, out_uncond], dim=0)
             out = self.batch_to_head_dim(out)
